@@ -1,0 +1,99 @@
+experiment:
+  name: "blackwell-sweep-tier1-optimized"
+  description: "hyperparameters inference test"
+  seed: 42
+
+models:
+  
+  
+  - id: "google/gemma-4-31B-it-qat-w4a16-ct"
+    backend: "vllm"
+    description: "Extreme 4-bit quantized variant - captures efficiency floor"
+    max_seq_length: 4096
+
+dataset:
+  source: "hf"
+  path: "maritaca-ai/enem"
+  split: "train"
+  max_samples: 10
+  schema_fallback_keys:
+    question: ["question", "text", "input", "prompt"]
+    answer: ["answer", "label", "output", "target", "alternatives"]
+
+hyperparameters:
+  quantization:
+    - null           
+    - "int4"         
+  cache_config:
+    - name: "baseline"
+      kv_cache: false
+      prefix_cache: false
+      description: "No caching (reference point)"
+    
+    - name: "kv_only"
+      kv_cache: true
+      prefix_cache: false
+      description: "KV cache for memory efficiency"
+  
+  max_new_tokens: 256
+
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  repetition_penalty: 1.0
+  do_sample: false
+
+hardware:
+  monitor_interval_ms: 50         
+  gpu_device_index: 0
+  tdp_limit_watts: 300           
+  capture_full_telemetry: true
+
+output:
+  results_dir: "results/tier1"
+  compress: "snappy"
+  include_telemetry_samples: true
+  output_formats:
+    - "parquet"                   
+    - "json"                      
+
+mock:
+  enabled: false
+  simulate_oom_probability: 0.0
+  base_latency_ms: 120
+  tokens_per_second: 80
+
+execution:
+  mode: "distributed"             
+  max_workers: 8                   
+  timeout_seconds: 300             
+  retry_strategy:
+    max_retries: 2
+    backoff_multiplier: 2.0
+    on_oom: "skip"                
+    on_timeout: "skip"            
+
+analysis:
+  output_formats:
+    - "parquet"
+    - "csv"
+  metrics:
+    - "accuracy_pct"
+    - "latency_ms"
+    - "throughput_tokens_per_sec"
+    - "time_to_first_token_ms"
+    - "vram_peak_mb"
+    - "vram_mean_mb"
+    - "power_mean_watts"
+    - "gpu_utilization_pct"
+  groupby:
+    - "model_id"
+    - "quantization"
+    - "cache_config"
+  
+
+  generate_comparison_tables: true
+  comparison_axes:
+    - ["model_id", "quantization"]
+    - ["cache_config", "quantization"]
+    - ["model_id", "cache_config"]
