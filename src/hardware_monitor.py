@@ -5,13 +5,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _NVML_AVAILABLE = False
-_nvml_handle = None
 
 try:
     import pynvml
@@ -95,7 +94,8 @@ class HardwareMonitor:
 
     def start(self) -> None:
         self._running = True
-        self._snapshots.clear()
+        with self._lock:
+            self._snapshots.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="hw-monitor")
         self._thread.start()
 

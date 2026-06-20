@@ -1,12 +1,15 @@
-"""Accuracy evaluator with Exact Match and Sabiá-4 (Maritaca) LLM-judge mock."""
+"""Accuracy evaluator with Exact Match, normalized match, and LLM-as-a-judge (mock or real API)."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import string
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
+
+from prompts.templates import OPTIONS_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -63,25 +66,26 @@ def _extract_choice(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sabiá-4 LLM judge (mock)
+# Judge protocol — anything with .judge(question, reference, prediction)
 # ---------------------------------------------------------------------------
 
-class Sabia4JudgeMock:
-    """
-    Deterministic mock of the Maritaca Sabiá-4 API for correctness judgement.
-    In production, replace _call_api() with actual HTTP requests to the
-    Maritaca endpoint (api.maritaca.ai/chat/completions).
-    """
+class Judge(Protocol):
+    def judge(self, question: str, reference: str, prediction: str) -> tuple[float, str]: ...
 
-    _SYSTEM = (
-        "You are an impartial judge. Given a question, a reference answer, and a "
-        "model prediction, score the prediction on a scale from 0.0 (completely wrong) "
-        "to 1.0 (perfectly correct). Reply ONLY with a JSON object: "
-        '{"score": <float>, "label": "<correct|partial|incorrect>"}.'
-    )
+
+# ---------------------------------------------------------------------------
+# Heuristic judge (no network calls — string-similarity mock)
+# ---------------------------------------------------------------------------
+
+class HeuristicJudgeMock:
+    """
+    Deterministic, offline judge based on normalized-string/choice matching.
+    Useful for mock-backend sweeps where no API call should be made at all.
+    For a real LLM-as-a-judge, use APIJudge below (works with Maritaca's
+    Sabiá models too — see the 'maritaca' provider preset in config_parser.APISpec).
+    """
 
     def judge(self, question: str, reference: str, prediction: str) -> tuple[float, str]:
-        """Return (score, label). Uses mock logic; swap for real API call."""
         norm_ref  = _normalize(reference)
         norm_pred = _normalize(prediction)
 
@@ -98,17 +102,48 @@ class Sabia4JudgeMock:
 
         return 0.0, "incorrect"
 
-    # Stub for real Maritaca API integration:
-    # def _call_api(self, payload: dict) -> dict:
-    #     import httpx
-    #     resp = httpx.post(
-    #         "https://api.maritaca.ai/api/chat/completions",
-    #         headers={"Authorization": f"Key {os.environ['MARITACA_API_KEY']}"},
-    #         json=payload,
-    #         timeout=30,
-    #     )
-    #     resp.raise_for_status()
-    #     return resp.json()
+
+# ---------------------------------------------------------------------------
+# Real LLM judge — a judge is just an OpenAI-API-compatible model with a
+# scoring prompt, so it reuses OpenAICompatibleEngine instead of duplicating
+# client setup / API-calling code. Works with OpenAI, OpenRouter (proxies
+# Claude/Gemini/etc.), Maritaca's Sabiá models, or a self-hosted server —
+# whichever provider is named in the APISpec config (config_parser.APISpec).
+# ---------------------------------------------------------------------------
+
+class APIJudge:
+    _SYSTEM = (
+        "You are an impartial judge. Given a question, a reference answer, and a "
+        "model prediction, score the prediction on a scale from 0.0 (completely wrong) "
+        "to 1.0 (perfectly correct). Reply with ONLY a JSON object, no other text: "
+        '{"score": <float 0.0-1.0>, "label": "<correct|partial|incorrect>"}.'
+    )
+
+    def __init__(self, api_config: dict):
+        from .inference_engine import OpenAICompatibleEngine
+
+        model_name = api_config.get("model") or "gpt-4o-mini"
+        self._engine = OpenAICompatibleEngine()
+        self._engine.load_model(model_name, {"api_config": api_config})
+
+    def judge(self, question: str, reference: str, prediction: str) -> tuple[float, str]:
+        prompt = (
+            f"{self._SYSTEM}\n\n"
+            f"Question:\n{question}\n\n"
+            f"Reference answer:\n{reference}\n\n"
+            f"Model prediction:\n{prediction}\n\n"
+            "Score the prediction now."
+        )
+        try:
+            text, _meta = self._engine.generate(prompt, max_new_tokens=100, temperature=0.0)
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            payload = json.loads(match.group(0) if match else text)
+            score = float(payload.get("score", 0.0))
+            label = str(payload.get("label", "incorrect"))
+            return max(0.0, min(1.0, score)), label
+        except Exception as e:
+            logger.warning("APIJudge call failed, scoring as incorrect: %s", e)
+            return 0.0, "incorrect"
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +151,19 @@ class Sabia4JudgeMock:
 # ---------------------------------------------------------------------------
 
 class Evaluator:
-    def __init__(self, use_judge: bool = False):
-        self._use_judge = use_judge
-        self._judge = Sabia4JudgeMock() if use_judge else None
+    def __init__(self, use_judge: bool = False, judge: Optional["Judge"] = None):
+        """
+        Pass `judge=` with a Judge instance (HeuristicJudgeMock or APIJudge) for
+        explicit control. The legacy `use_judge=True` with no `judge=` still
+        defaults to the deterministic mock for backward compatibility.
+        """
+        if judge is not None:
+            self._judge = judge
+        elif use_judge:
+            self._judge = HeuristicJudgeMock()
+        else:
+            self._judge = None
+        self._use_judge = self._judge is not None
 
     def evaluate_batch(
         self,
@@ -126,18 +171,35 @@ class Evaluator:
         references: list[str],
         predictions: list[str],
     ) -> EvalSummary:
-        assert len(prompts) == len(references) == len(predictions)
+        if not len(prompts) == len(references) == len(predictions):
+            raise ValueError(
+                f"prompts/references/predictions length mismatch: "
+                f"{len(prompts)}/{len(references)}/{len(predictions)}"
+            )
 
         records: list[EvalRecord] = []
         judge_scores: list[float] = []
 
         for prompt, ref, pred in zip(prompts, references, predictions):
-            em  = ref.strip() == pred.strip()
-            nem = _normalize(ref) == _normalize(pred)
+            # For multiple-choice questions: aggressively extract just the first choice letter
+            processed_pred = pred.strip()
+            if OPTIONS_MARKER in prompt:
+                # Try to find any A-E letter in the prediction
+                m = re.search(r"[A-Ea-e]", pred)
+                if m:
+                    processed_pred = m.group(0).upper()
+                else:
+                    # Fallback: use standard extraction
+                    extracted = _extract_choice(pred)
+                    if extracted and len(extracted) == 1 and extracted.isalpha():
+                        processed_pred = extracted
+
+            em  = ref.strip() == processed_pred
+            nem = _normalize(ref) == _normalize(processed_pred)
 
             # Also try single-char choice comparison
             if not nem:
-                nem = _extract_choice(ref) == _extract_choice(pred)
+                nem = _extract_choice(ref) == _extract_choice(processed_pred)
 
             rec = EvalRecord(
                 prompt=prompt,

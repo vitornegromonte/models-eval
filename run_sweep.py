@@ -16,8 +16,8 @@ logging.basicConfig(
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.config_parser import load_config
-from src.orchestrator import Orchestrator
+from src.config_parser import BenchmarkConfig, load_config  # noqa: E402 — must follow sys.path setup above
+from src.orchestrator import Orchestrator  # noqa: E402
 
 
 def main() -> None:
@@ -34,9 +34,13 @@ def main() -> None:
 
     cfg = load_config(args.config)
     if args.mock:
-        cfg.mock.enabled = True
-        for m in cfg.models:
-            m.backend = "mock"
+        # Re-validate rather than mutating cfg.mock.enabled + each model's
+        # backend by hand — that duplicated BenchmarkConfig's own
+        # _mock_overrides_backends validator and would silently drift out of
+        # sync if that validator's logic ever changed.
+        raw = cfg.model_dump()
+        raw["mock"]["enabled"] = True
+        cfg = BenchmarkConfig.model_validate(raw)
 
     orchestrator = Orchestrator(cfg)
     out_path = orchestrator.run()

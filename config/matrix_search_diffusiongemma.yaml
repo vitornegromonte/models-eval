@@ -1,0 +1,57 @@
+experiment:
+  name: "blackwell-diffusiongemma-reasoning"
+  description: "DiffusionGemma-26B with reasoning and tool use"
+  seed: 42
+
+models:
+  - id: "nvidia/diffusiongemma-26B-A4B-IT-NVFP4"
+    backend: "vllm"
+    vllm_advanced:
+      trust_remote_code: true
+      attention_backend: "triton"          # Enable Triton attention kernel
+      max_num_seqs: 4                      # Batch size
+
+dataset:
+  source: "hf"
+  path: "maritaca-ai/enem"
+  split: "train"
+  max_samples: 540
+  schema_fallback_keys:
+    question: ["question", "text", "input", "prompt"]
+    answer: ["answer", "label", "output", "target", "alternatives"]
+
+hyperparameters:
+  quantization:
+    - null           # Full precision (DiffusionGemma is pre-quantized as FP4)
+  cache_config:
+    - name: "baseline"
+      kv_cache: false
+      prefix_cache: false
+      description: "No caching (reference point)"
+
+  max_new_tokens: 512  # Allow more tokens for reasoning output
+
+generation:
+  temperature: 0.0
+  top_p: 0.95
+  repetition_penalty: 1.0
+
+hardware:
+  monitor_interval_ms: 50
+  gpu_device_index: 0
+  tdp_limit_watts: 300
+
+output:
+  results_dir: "results/diffusiongemma"
+  compress: "snappy"
+
+mock:
+  enabled: false
+  simulate_oom_probability: 0.0
+  base_latency_ms: 120
+  tokens_per_second: 80
+
+# Note: execution is always sequential, one subprocess per cell, with a
+# hardcoded 3600s timeout and OOM/error-skip-and-continue policy (see
+# src/orchestrator.py) — there is no config surface for tuning that yet.
+# Use extract_results.py against the output Parquet for post-hoc analysis.

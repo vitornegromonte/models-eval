@@ -3,3 +3,4 @@ CLAUDE.md
 .env
 __pycache__
 results/
+*.log

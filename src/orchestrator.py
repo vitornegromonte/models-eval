@@ -5,15 +5,12 @@ Each worker runs independently so GPU telemetry is never cross-contaminated.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import multiprocessing as mp
-import os
-import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -40,14 +37,23 @@ def _worker(
     generation_cfg: dict,
     mock_cfg_dict: dict,
     use_judge: bool,
+    vllm_advanced_dict: Optional[dict] = None,
+    api_config_dict: Optional[dict] = None,
+    judge_cfg_dict: Optional[dict] = None,
 ) -> None:
     """Full benchmark run for one (model, hyperparams) cell. Sends result dict to queue."""
     logging.basicConfig(level=logging.INFO)
 
     from .config_parser import MockSpec
-    from .evaluator import Evaluator
-    from .hardware_monitor import HardwareMonitor
-    from .inference_engine import build_engine
+    from .evaluator import APIJudge, HeuristicJudgeMock
+    from prompts.templates import OPTIONS_MARKER
+
+    if vllm_advanced_dict is None:
+        vllm_advanced_dict = {}
+    if api_config_dict is None:
+        api_config_dict = {}
+    if judge_cfg_dict is None:
+        judge_cfg_dict = {}
 
     result: dict[str, Any] = {
         "model_id": model_id,
@@ -62,7 +68,19 @@ def _worker(
     try:
         engine = build_engine(backend, mock_spec if backend == "mock" else None)
         monitor = HardwareMonitor(interval_ms=50)
-        evaluator = Evaluator(use_judge=use_judge)
+
+        judge = None
+        if use_judge:
+            if judge_cfg_dict.get("provider") == "api":
+                judge = APIJudge(judge_cfg_dict["api_config"])
+            else:
+                judge = HeuristicJudgeMock()
+        evaluator = Evaluator(judge=judge)
+
+        # Merge vllm_advanced/api options with hyperparams for engine config
+        engine_config = {**hyperparams, **vllm_advanced_dict}
+        if api_config_dict:
+            engine_config["api_config"] = api_config_dict
 
         predictions: list[str] = []
         ttfts: list[float] = []
@@ -70,21 +88,29 @@ def _worker(
         total_s_list: list[float] = []
 
         with monitor:
-            engine.load_model(model_id, hyperparams)
+            engine.load_model(model_id, engine_config)
+            try:
+                for prompt in prompts:
+                    # For multiple-choice questions, constrain to 10 tokens (forces short output)
+                    max_tokens = engine_config.get("max_new_tokens", 256)
+                    if OPTIONS_MARKER in prompt:
+                        max_tokens = 10
 
-            for prompt in prompts:
-                text, meta = engine.generate(
-                    prompt,
-                    max_new_tokens=hyperparams.get("max_new_tokens", 256),
-                    **generation_cfg,
-                )
-                predictions.append(text)
-                if meta.get("ttft_s") is not None:
-                    ttfts.append(meta["ttft_s"])
-                tps_list.append(meta["tps"])
-                total_s_list.append(meta["total_s"])
-
-            engine.cleanup()
+                    text, meta = engine.generate(
+                        prompt,
+                        max_new_tokens=max_tokens,
+                        **generation_cfg,
+                    )
+                    predictions.append(text)
+                    if meta.get("ttft_s") is not None:
+                        ttfts.append(meta["ttft_s"])
+                    tps_list.append(meta["tps"])
+                    total_s_list.append(meta["total_s"])
+            finally:
+                # Always release GPU/client resources, even if generate() raises
+                # mid-loop (e.g. OOM on sample N) — don't rely on subprocess
+                # teardown as the only cleanup path.
+                engine.cleanup()
 
         hw = monitor.summarize()
         eval_summary = evaluator.evaluate_batch(prompts, references, predictions)
@@ -118,7 +144,20 @@ def _worker(
 
     except RuntimeError as e:
         msg = str(e)
-        if "out of memory" in msg.lower() or "cuda" in msg.lower():
+        # Prefer a precise isinstance check against torch's actual OOM type;
+        # fall back to the "out of memory" substring (specific enough on its
+        # own) for non-torch backends. Deliberately NOT matching on "cuda"
+        # alone — that swallowed unrelated errors (e.g. driver/version
+        # mismatches) and silently misclassified them as skippable OOMs.
+        is_oom = "out of memory" in msg.lower()
+        if not is_oom:
+            try:
+                import torch
+                is_oom = isinstance(e, torch.cuda.OutOfMemoryError)
+            except ImportError:
+                pass
+
+        if is_oom:
             result.update({"status": "oom", "error": msg})
             logger.error("OOM on %s %s: %s", model_id, hyperparams, msg)
         else:
@@ -236,6 +275,10 @@ class Orchestrator:
             "repetition_penalty": cfg.generation.repetition_penalty,
         }
         mock_cfg_dict = cfg.mock.model_dump()
+        # model_dump() already recurses into nested api_config; provider presets
+        # (base_url, api_key_env) are resolved downstream by APIJudge/OpenAICompatibleEngine.
+        judge_cfg_dict = cfg.judge.model_dump()
+        use_judge = cfg.judge.enabled
 
         for model_spec in cfg.models:
             cached = _model_is_cached(model_spec.id)
@@ -252,6 +295,13 @@ class Orchestrator:
                     cell_idx, total_cells, model_spec.id, model_spec.backend, hp,
                 )
 
+                # Convert nested specs to plain dicts for multiprocessing; provider
+                # presets are resolved downstream by OpenAICompatibleEngine itself.
+                vllm_advanced_dict = model_spec.vllm_advanced.model_dump() if model_spec.vllm_advanced else {}
+                if model_spec.max_seq_length is not None:
+                    vllm_advanced_dict["max_seq_length"] = model_spec.max_seq_length
+                api_config_dict = model_spec.api_config.model_dump() if model_spec.api_config else {}
+
                 result = self._run_cell_isolated(
                     model_id=model_spec.id,
                     backend=model_spec.backend,
@@ -260,6 +310,10 @@ class Orchestrator:
                     references=references,
                     generation_cfg=generation_cfg,
                     mock_cfg_dict=mock_cfg_dict,
+                    vllm_advanced_dict=vllm_advanced_dict,
+                    api_config_dict=api_config_dict,
+                    use_judge=use_judge,
+                    judge_cfg_dict=judge_cfg_dict,
                 )
                 result["cell_idx"] = cell_idx
                 result["experiment"] = cfg.experiment.name
@@ -289,9 +343,20 @@ class Orchestrator:
         references: list[str],
         generation_cfg: dict,
         mock_cfg_dict: dict,
+        vllm_advanced_dict: Optional[dict] = None,
+        api_config_dict: Optional[dict] = None,
+        use_judge: bool = False,
+        judge_cfg_dict: Optional[dict] = None,
     ) -> dict:
         """Spawn a fresh sub-process for each (model, hyperparams) cell."""
         queue: mp.Queue = self._mp_ctx.Queue()
+
+        if vllm_advanced_dict is None:
+            vllm_advanced_dict = {}
+        if api_config_dict is None:
+            api_config_dict = {}
+        if judge_cfg_dict is None:
+            judge_cfg_dict = {}
 
         proc = self._mp_ctx.Process(
             target=_worker,
@@ -304,7 +369,10 @@ class Orchestrator:
                 references,
                 generation_cfg,
                 mock_cfg_dict,
-                False,   # use_judge: set True to enable Sabiá-4 judge per-call
+                use_judge,
+                vllm_advanced_dict,
+                api_config_dict,
+                judge_cfg_dict,
             ),
             daemon=False,
         )
@@ -326,7 +394,7 @@ class Orchestrator:
             try:
                 result = queue.get_nowait()
                 return result
-            except:
+            except Exception:
                 return {
                     "model_id": model_id,
                     "backend": backend,

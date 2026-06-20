@@ -17,6 +17,10 @@ psutil>=6.0.0
 pydantic>=2.8.0
 PyYAML>=6.0.2
 
+# OpenAI-API-compatible client — also used for OpenRouter, Gemini, and
+# LLM-as-a-judge (api backend / api judge provider)
+openai>=1.40.0
+
 # Dataset access
 datasets>=3.0.0
 huggingface-hub>=0.25.0
@@ -28,3 +32,6 @@ fastparquet>=2024.2.0
 
 # Utilities
 tqdm>=4.66.0
+
+# Testing
+pytest>=8.0.0
